@@ -78,7 +78,7 @@ int main(int argc, char **argv){
     cudaEventElapsedTime( &elapsedTime,start, stop );
     cout << "The Evaluation STATUS \n";
     cout << "==================================\n";
-    cout << "CORRECTNESS : "<< (EVALUATE(N)==true?"PASS":"FAIL")<<"\nCOST TIME : "<< elapsedTime << "(ms)"<<endl;
+    cout << "CORRECTNESS : "<< (EVALUATE(N)==true?"PASS":"FAIL")<<"\nCOST TIME : "<< elapsedTime <<endl;
     cout << "==================================\n";
     return 0;
 }
