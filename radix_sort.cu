@@ -4,9 +4,10 @@
 #include <math.h>
 #include <cuda_runtime.h>
 #include <fstream>
+#include <cub/cub.cuh>
 using namespace std;
 #define MAX_NUM_LISTS 256
-
+#define BlockSize 128
 cudaEvent_t start, stop;
 float *Data,*dev_srcData,*dev_dstData;
 
@@ -20,6 +21,11 @@ __device__ void merge_list( float* src_data, float*  dest_list, \
     int num_lists, int num_data, int tid); 
 __device__ void preprocess_float(float*  data, int num_lists, int num_data, int tid);
 __device__ void Aeprocess_float(float*  data, int num_lists, int num_data, int tid);
+
+// radix sort v1 : intra block radix sort
+__global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_data);
+__global__ void Data_Preprocess(float* src_data,int num_data);
+__global__ void Data_Postprocess(float* src_data,int num_data);
 
 // Auxiliariy function
 void INPUT(char* FIN,int N);
@@ -51,7 +57,12 @@ int main(int argc, char **argv){
     int num_lists = 128; // the number of parallel threads
     // radix sort
     cudaEventRecord( start, 0 ) ;
-    GPU_radix_sort<<<1,num_lists>>>(dev_srcData, dev_dstData, num_lists, N);
+    // GPU_radix_sort<<<1,num_lists>>>(dev_srcData, dev_dstData, num_lists, N);
+    Data_Preprocess<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_srcData,N);
+
+
+
+    Data_Postprocess<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_dstData,N);
     cudaEventRecord( stop, 0 ) ;
     cudaEventSynchronize( stop );
 
@@ -60,13 +71,14 @@ int main(int argc, char **argv){
     // output
     cudaFree(dev_srcData);
     cudaFree(dev_dstData);
+    SHOW(N);
     OUTPUT(FOUT,N);
 
     // Test the correstness and output the running time
     cudaEventElapsedTime( &elapsedTime,start, stop );
     cout << "The Evaluation STATUS \n";
     cout << "==================================\n";
-    cout << "CORRECTNESS : "<< (EVALUATE(N)==true?"PASS":"FAIL")<<"\nCOST TIME : "<< elapsedTime << endl;
+    cout << "CORRECTNESS : "<< (EVALUATE(N)==true?"PASS":"FAIL")<<"\nCOST TIME : "<< elapsedTime << "(ms)"<<endl;
     cout << "==================================\n";
     return 0;
 }
@@ -119,8 +131,7 @@ __global__ void GPU_radix_sort(float*  src_data, float*  dest_data, \
     __syncthreads();
 }
 
-__device__ void preprocess_float(float*  src_data, int num_lists, int num_data, int tid)
-{
+__device__ void preprocess_float(float*  src_data, int num_lists, int num_data, int tid){
     for(int i = tid;i<num_data;i+=num_lists)
     {
         unsigned int *data_temp = (unsigned int *)(&src_data[i]);    
@@ -128,8 +139,7 @@ __device__ void preprocess_float(float*  src_data, int num_lists, int num_data, 
     }
 }
 
-__device__ void Aeprocess_float(float*  data, int num_lists, int num_data, int tid)
-{
+__device__ void Aeprocess_float(float*  data, int num_lists, int num_data, int tid){
     for(int i = tid;i<num_data;i+=num_lists)
     {
         unsigned int* data_temp = (unsigned int *)(&data[i]);
@@ -139,8 +149,7 @@ __device__ void Aeprocess_float(float*  data, int num_lists, int num_data, int t
 
 
 __device__ void radix_sort(float*  data_0, float*  data_1, \
-    int num_lists, int num_data, int tid) 
-{
+    int num_lists, int num_data, int tid) {
     for(int bit=0;bit<32;bit++)
     {
         int bit_mask = (1 << bit);
@@ -167,8 +176,7 @@ __device__ void radix_sort(float*  data_0, float*  data_1, \
 }
 
 __device__ void merge_list( float* src_data, float*  dest_list, \
-    int num_lists, int num_data, int tid) 
-{
+    int num_lists, int num_data, int tid) {
     int num_per_list = ceil((float)num_data/num_lists);
     __shared__ int list_index[MAX_NUM_LISTS];
     __shared__ float record_val[MAX_NUM_LISTS];
@@ -219,4 +227,50 @@ __device__ void merge_list( float* src_data, float*  dest_list, \
         }
         __syncthreads();
     }
+}
+
+
+
+__global__ void Data_Preprocess(float* src_data,int num_data){
+    int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    if(tid>=num_data) return ;
+    unsigned int* data_temp=(unsigned int*)&src_data[tid];
+    *data_temp=(float)(( *data_temp>>31 & 0x1) ? ~( *data_temp) : ( *data_temp|0x80000000));
+}
+__global__ void Data_Postprocess(float* src_data,int num_data){
+    int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    if(tid>=num_data) return;
+    unsigned int* data_temp=(unsigned int*)&src_data[tid];
+    *data_temp=(float)((*data_temp>>31 & 0x1) ? (*data_temp & 0x7FFFFFFF) : ~(*data_temp));
+}
+
+__global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_data){
+    // int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    // // load block data to share memory
+    // __shared__ unsigned int sData[BlockSize];
+    // __shared__ unsigned int FalseBuffer[BlockSize];
+    // unsigned int bit_mask=1,total_False;
+    // sData[threadIdx.x]=src_data[tid];
+    // __syncthreads();
+    // // 32 pass radix sort
+    // for(int i=0;i<32;i++){
+    //     // compte False potision
+    //     FalseBuffer[threadIdx.x]=(sData[threadIdx.x]&bit_mask)?0:1;
+    //     __syncthreads();
+    //     // prefix sum
+
+
+    //     __syncthreads();
+    //     total_False=
+    //     // compute position
+
+
+        
+    //     __syncthreads();
+    //     // scatter
+
+    //     bit_mask<<=1;
+    //     __syncthreads();
+    // }
+
 }
