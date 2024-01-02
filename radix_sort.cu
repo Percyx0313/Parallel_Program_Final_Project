@@ -7,7 +7,7 @@
 #include <cub/cub.cuh>
 using namespace std;
 #define MAX_NUM_LISTS 256
-#define BlockSize 128
+#define BlockSize 1024
 cudaEvent_t start, stop;
 float *Data,*dev_srcData,*dev_dstData;
 
@@ -31,6 +31,7 @@ __global__ void Data_Postprocess(float* src_data,int num_data);
 void INPUT(char* FIN,int N);
 void OUTPUT(char* FOUT,int N);
 void SHOW(int N);
+void SHOW_BIN(int N);
 bool EVALUATE(int N);
 int main(int argc, char **argv){
     if(argc!=4){
@@ -48,7 +49,7 @@ int main(int argc, char **argv){
     Data=new float[N];
     INPUT(FIN,N);
     SHOW(N);
-
+    SHOW_BIN(N);
     // cuda preprocess
     cudaMalloc((void**)&dev_srcData,sizeof(float)*N);
     cudaMalloc((void**)&dev_dstData,sizeof(float)*N);
@@ -59,9 +60,7 @@ int main(int argc, char **argv){
     cudaEventRecord( start, 0 ) ;
     // GPU_radix_sort<<<1,num_lists>>>(dev_srcData, dev_dstData, num_lists, N);
     Data_Preprocess<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_srcData,N);
-
-
-
+    Intra_Block_radix_sort<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_srcData,dev_dstData,N);
     Data_Postprocess<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_dstData,N);
     cudaEventRecord( stop, 0 ) ;
     cudaEventSynchronize( stop );
@@ -91,6 +90,17 @@ void SHOW(int N){
     cout << "\n==================================\n";
 }
 
+void SHOW_BIN(int N){
+    
+    cout << "======== Current Data BINARY =======\n";
+    for(int i=0;i<N;i++){
+        for(int k=0;k<32;k++){
+            cout << ((((unsigned int *)Data)[i]&(0x80000000>>k))?"1":"0");
+        }
+        cout << endl;
+    }
+    cout << "\n==================================\n";
+}
 void INPUT(char* FIN,int N){
     FILE* file = fopen(FIN, "rb");
     fread(Data,sizeof(float)*N,N,file);
@@ -135,7 +145,7 @@ __device__ void preprocess_float(float*  src_data, int num_lists, int num_data, 
     for(int i = tid;i<num_data;i+=num_lists)
     {
         unsigned int *data_temp = (unsigned int *)(&src_data[i]);    
-        *data_temp = (*data_temp >> 31 & 0x1)? ~(*data_temp): (*data_temp) | 0x80000000; 
+        *data_temp = (*data_temp >> 31 & 0x1)? ~(*data_temp): ((*data_temp) | 0x80000000); 
     }
 }
 
@@ -235,42 +245,67 @@ __global__ void Data_Preprocess(float* src_data,int num_data){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
     if(tid>=num_data) return ;
     unsigned int* data_temp=(unsigned int*)&src_data[tid];
-    *data_temp=(float)(( *data_temp>>31 & 0x1) ? ~( *data_temp) : ( *data_temp|0x80000000));
+    *data_temp=(( ((*data_temp)>>31) & 0x1) ? ~(*data_temp) : ((*data_temp)|0x80000000));
 }
 __global__ void Data_Postprocess(float* src_data,int num_data){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
     if(tid>=num_data) return;
     unsigned int* data_temp=(unsigned int*)&src_data[tid];
-    *data_temp=(float)((*data_temp>>31 & 0x1) ? (*data_temp & 0x7FFFFFFF) : ~(*data_temp));
+    *data_temp=(((*data_temp)>>31 & 0x1) ? ((*data_temp) & 0x7fffffff) : ~(*data_temp));
 }
 
+
+__device__ void SHOW_BUFFER(unsigned int* sData , int num_data){
+    for(int i=0;i<num_data;i++){
+        printf("%d ",sData[i]);
+    }
+    printf("\n");
+}
 __global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_data){
-    // int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    if(tid>= num_data) return ;
     // // load block data to share memory
-    // __shared__ unsigned int sData[BlockSize];
-    // __shared__ unsigned int FalseBuffer[BlockSize];
-    // unsigned int bit_mask=1,total_False;
-    // sData[threadIdx.x]=src_data[tid];
-    // __syncthreads();
-    // // 32 pass radix sort
-    // for(int i=0;i<32;i++){
-    //     // compte False potision
-    //     FalseBuffer[threadIdx.x]=(sData[threadIdx.x]&bit_mask)?0:1;
-    //     __syncthreads();
-    //     // prefix sum
+    __shared__ unsigned int sData[BlockSize];
+    __shared__ unsigned int tempData[BlockSize];
+    __shared__ unsigned int FalseBuffer[BlockSize]; // e buffer
+    __shared__ unsigned int PrefixFalseBuffer[BlockSize]; // f buffer
+    __shared__ unsigned int Position[BlockSize];
+    __shared__ unsigned int total_False;
+    unsigned int bit_mask=1;
+    sData[threadIdx.x]=((unsigned int*)src_data)[tid]; 
 
-
-    //     __syncthreads();
-    //     total_False=
-    //     // compute position
-
+    __syncthreads();
+    // 32 pass radix sort
+    for(int i=0;i<32;i++){
+        // compte False potision
+        FalseBuffer[threadIdx.x]=(sData[threadIdx.x]&bit_mask)?0:1;
 
         
-    //     __syncthreads();
-    //     // scatter
+        __syncthreads();
+        // prefix sum
+        if(tid==0){
+            PrefixFalseBuffer[0]=0;
+            for(int k=1;k<num_data;k++){
+                PrefixFalseBuffer[k]=PrefixFalseBuffer[k-1]+FalseBuffer[k-1];
+            }
+            total_False=PrefixFalseBuffer[num_data-1]+FalseBuffer[num_data-1];
+        }
 
-    //     bit_mask<<=1;
-    //     __syncthreads();
-    // }
+        __syncthreads();
+        // // compute position
+        Position[tid]=FalseBuffer[tid]?PrefixFalseBuffer[tid]:tid-PrefixFalseBuffer[tid]+total_False;
 
+        
+        __syncthreads();
+        // scatter
+        tempData[Position[tid]]=sData[tid];
+        bit_mask<<=1;
+        __syncthreads();
+        // // save data
+        sData[threadIdx.x]=tempData[tid];
+        __syncthreads();
+    }
+    
+    dest_data[tid]=((float*)sData)[threadIdx.x];
+    __syncthreads();
 }
