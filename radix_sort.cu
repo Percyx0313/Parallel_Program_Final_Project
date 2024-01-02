@@ -261,16 +261,59 @@ __device__ void SHOW_BUFFER(unsigned int* sData , int num_data){
     }
     printf("\n");
 }
+
+
+__device__ void ScanWarp(unsigned int* sData,unsigned int lane){
+    // if(lane==0){
+    //     for(int i=1;i<32;i++){
+    //         sData[i]+=sData[i-1];
+    //     }
+    // }
+    if(lane>=1)
+        sData[lane]+=sData[lane-1];
+    __syncwarp();
+    if(lane>=2)
+        sData[lane]+=sData[lane-2];
+     __syncwarp();
+    if(lane>=4)
+        sData[lane]+=sData[lane-4];
+    __syncwarp();
+    if(lane>=8)
+        sData[lane]+=sData[lane-8];
+    __syncwarp();
+    if(lane>=16)
+        sData[lane]+=sData[lane-16];
+    __syncwarp();
+}
+__device__ void ScanBlock(unsigned int* sData){
+    unsigned int warp_id=threadIdx.x>>5; // each warp has 32 thread
+    unsigned int lane = threadIdx.x & 31;  // 31 = 00011111 (i.e. mod 31)
+    __shared__  unsigned int warp_sum[32];  // block size 1024 / warp size 32 = 32 
+    ScanWarp(sData+(warp_id<<5),lane);
+    __syncthreads();
+    if(lane==31){
+        warp_sum[warp_id]=sData[threadIdx.x];
+    }
+    __syncthreads();
+    if(warp_id==0){
+        ScanWarp(warp_sum,lane);
+    }
+    __syncthreads();
+    if(warp_id>0){
+        *(sData+threadIdx.x)+=warp_sum[warp_id-1];
+    }
+    __syncthreads();
+}
+
 __global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_data){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
     if(tid>= num_data) return ;
     // // load block data to share memory
     __shared__ unsigned int sData[BlockSize];
     __shared__ unsigned int tempData[BlockSize];
-    __shared__ unsigned int FalseBuffer[BlockSize]; // e buffer
-    __shared__ unsigned int PrefixFalseBuffer[BlockSize]; // f buffer
+    __shared__ unsigned int FalseBuffer[BlockSize+1]; // e buffer
+    __shared__ unsigned int PrefixFalseBuffer[BlockSize+1]; // f buffer
     __shared__ unsigned int Position[BlockSize];
-    __shared__ unsigned int total_False;
     unsigned int bit_mask=1;
     sData[threadIdx.x]=((unsigned int*)src_data)[tid]; 
 
@@ -281,19 +324,23 @@ __global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_
         FalseBuffer[threadIdx.x]=(sData[threadIdx.x]&bit_mask)?0:1;
 
         
+        
         __syncthreads();
-        // prefix sum
-        if(tid==0){
-            PrefixFalseBuffer[0]=0;
-            for(int k=1;k<num_data;k++){
-                PrefixFalseBuffer[k]=PrefixFalseBuffer[k-1]+FalseBuffer[k-1];
-            }
-            total_False=PrefixFalseBuffer[num_data-1]+FalseBuffer[num_data-1];
-        }
-
+        //prefix sum
+        // if(tid==0){
+        //     PrefixFalseBuffer[0]=0;
+        //     for(int k=1;k<num_data;k++){
+        //         PrefixFalseBuffer[k]=PrefixFalseBuffer[k-1]+FalseBuffer[k-1];
+        //     }
+        //     total_False=PrefixFalseBuffer[num_data-1]+FalseBuffer[num_data-1];
+        // }
+        // __syncthreads();
+        PrefixFalseBuffer[tid+1]=FalseBuffer[tid];
+        __syncthreads();
+        ScanBlock(PrefixFalseBuffer+1);// The last one is total false
         __syncthreads();
         // // compute position
-        Position[tid]=FalseBuffer[tid]?PrefixFalseBuffer[tid]:tid-PrefixFalseBuffer[tid]+total_False;
+        Position[tid]=FalseBuffer[tid]?PrefixFalseBuffer[tid]:tid-PrefixFalseBuffer[tid]+PrefixFalseBuffer[num_data];
 
         
         __syncthreads();
