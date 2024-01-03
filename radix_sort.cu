@@ -244,14 +244,14 @@ __device__ void merge_list( float* src_data, float*  dest_list, \
 __global__ void Data_Preprocess(float* src_data,int num_data){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
     if(tid>=num_data) return ;
-    unsigned int* data_temp=(unsigned int*)&src_data[tid];
-    *data_temp=(( ((*data_temp)>>31) & 0x1) ? ~(*data_temp) : ((*data_temp)|0x80000000));
+    unsigned int data_temp=((unsigned int*)src_data)[tid];
+    ((unsigned int*)src_data)[tid]=(( (data_temp>>31) & 0x1) ? ~(data_temp) : ((data_temp)|0x80000000));
 }
 __global__ void Data_Postprocess(float* src_data,int num_data){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
     if(tid>=num_data) return;
-    unsigned int* data_temp=(unsigned int*)&src_data[tid];
-    *data_temp=(((*data_temp)>>31 & 0x1) ? ((*data_temp) & 0x7fffffff) : ~(*data_temp));
+    unsigned int data_temp=((unsigned int*)src_data)[tid];
+    ((unsigned int*)src_data)[tid]=(((data_temp)>>31 & 0x1) ? ((data_temp) & 0x7fffffff) : ~(data_temp));
 }
 
 
@@ -269,6 +269,7 @@ __device__ void ScanWarp(unsigned int* sData,unsigned int lane){
     //         sData[i]+=sData[i-1];
     //     }
     // }
+    // Kogge-Stone
     if(lane>=1)
         sData[lane]+=sData[lane-1];
     __syncwarp();
@@ -284,6 +285,17 @@ __device__ void ScanWarp(unsigned int* sData,unsigned int lane){
     if(lane>=16)
         sData[lane]+=sData[lane-16];
     __syncwarp();
+    // // Reduce-then-scan
+    // if(lane&0x00000001)
+    //     sData[lane]+=sData[lane-1];
+    // __syncwarp();
+    // if(lane&0x00000011)
+    //     sData[lane]+=sData[lane-2];
+    // __syncwarp();
+    // if(lane&0x00000111)
+    //     sData[lane]+=sData[lane-1];
+    // __syncwarp();
+    
 }
 __device__ void ScanBlock(unsigned int* sData){
     unsigned int warp_id=threadIdx.x>>5; // each warp has 32 thread
