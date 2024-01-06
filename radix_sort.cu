@@ -5,27 +5,179 @@
 #include <cuda_runtime.h>
 #include <fstream>
 #include <cub/cub.cuh>
+#include <cooperative_groups.h>
+
 using namespace std;
 #define MAX_NUM_LISTS 256
-#define BlockSize 1024
+#define BlockSize 1024 
+#define MAX_ELEMENTS_PER_BLOCK 1024
+#define Way_N 4
 cudaEvent_t start, stop;
 float *Data,*dev_srcData,*dev_dstData;
-
-
-// radix sort
-__global__ void GPU_radix_sort(float* src_data, float*  dest_data, \
-    int num_lists, int num_data);
-__device__ void radix_sort(float*  data_0, float*  data_1, \
-    int num_lists, int num_data, int tid); 
-__device__ void merge_list( float* src_data, float*  dest_list, \
-    int num_lists, int num_data, int tid); 
-__device__ void preprocess_float(float*  data, int num_lists, int num_data, int tid);
-__device__ void Aeprocess_float(float*  data, int num_lists, int num_data, int tid);
+unsigned int* dev_BlockSum,* dev_BlockSum_Prefix,*dev_BlockSum_Status,*local_prefix0,*local_prefix1,*local_prefix2,*local_prefix3;
 
 // radix sort v1 : intra block radix sort
-__global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_data);
+__device__ unsigned int BLOCK_PREFIX_COUNTER,BLOCK_PREFIX_COMPLETE;
+__global__ void Init_Flag(){
+    if(threadIdx.x==0){
+        BLOCK_PREFIX_COUNTER=0;
+        BLOCK_PREFIX_COMPLETE=0;
+    }
+}
+__global__ void Intra_Block_radix_sort(float* src_data,int num_data,unsigned int *BlockSum,unsigned int *BlockSum_Prefix,int PASS,unsigned int* BLOCK_PREFIX_COMPLETE);
 __global__ void Data_Preprocess(float* src_data,int num_data);
 __global__ void Data_Postprocess(float* src_data,int num_data);
+// radix sort v3 : block radix sort and block prefix sum
+__device__ void ScanWarp(unsigned int* sData,unsigned int lane){
+    // Kogge-Stone
+    if(lane>=1)
+        sData[lane]+=sData[lane-1];
+    __syncwarp();
+    if(lane>=2)
+        sData[lane]+=sData[lane-2];
+     __syncwarp();
+    if(lane>=4)
+        sData[lane]+=sData[lane-4];
+    __syncwarp();
+    if(lane>=8)
+        sData[lane]+=sData[lane-8];
+    __syncwarp();
+    if(lane>=16)
+        sData[lane]+=sData[lane-16];
+    __syncwarp();
+}
+__device__ void ScanBlock(unsigned int* sData){
+    unsigned int warp_id=threadIdx.x>>5; // each warp has 32 thread
+    unsigned int lane = threadIdx.x & 31;  // 31 = 00011111 (i.e. mod 31)
+    __shared__  unsigned int warp_sum[32];  // block size 1024 / warp size 32 = 32 
+    ScanWarp(sData+(warp_id<<5),lane);
+    __syncthreads();
+    if(lane==31){
+        warp_sum[warp_id]=sData[threadIdx.x];
+    }
+    __syncthreads();
+    // Reduce-then-scan
+    if(warp_id==0){
+        ScanWarp(warp_sum,lane);
+    }
+    __syncthreads();
+    if(warp_id>0){
+        *(sData+threadIdx.x)+=warp_sum[warp_id-1];
+    }
+    __syncthreads();
+}
+
+__global__ void Radix_GSum_LPrefix(unsigned int* src_data,unsigned int* local_prefix0,unsigned int* local_prefix1,unsigned int* local_prefix2,unsigned int* local_prefix3,unsigned int* dev_BlockSum,int num_data,int PASS){
+    int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    if(tid>= num_data) return ;
+
+    unsigned int bit_mask_0=(0 << (PASS*2));
+    unsigned int bit_mask_1=(1 << (PASS*2));
+    unsigned int bit_mask_2=(2 << (PASS*2));    
+    unsigned int bit_mask_3=(3 << (PASS*2));
+    unsigned int bit_value;
+    int BlockNum=(num_data+BlockSize-1)/BlockSize;
+
+    unsigned int block_element_num=(blockIdx.x+1)*BlockSize<=num_data?BlockSize:num_data%BlockSize;
+    __shared__ unsigned int sData[BlockSize];
+    __shared__ unsigned int FalseBuffer_0[BlockSize+1]; // e0 buffer
+    __shared__ unsigned int FalseBuffer_1[BlockSize+1]; // e1 buffer
+    __shared__ unsigned int FalseBuffer_2[BlockSize+1]; // e2 buffer
+    __shared__ unsigned int FalseBuffer_3[BlockSize+1]; // e3 buffer
+
+    
+    __shared__ unsigned int PrefixFalseBuffer_0[BlockSize+1]; // f0 buffer
+    __shared__ unsigned int PrefixFalseBuffer_1[BlockSize+1]; // f1 buffer
+    __shared__ unsigned int PrefixFalseBuffer_2[BlockSize+1]; // f2 buffer
+    __shared__ unsigned int PrefixFalseBuffer_3[BlockSize+1]; // f3 buffer
+
+    sData[threadIdx.x]=((unsigned int*)src_data)[tid]; 
+    __syncthreads();
+    unsigned int temp_bit_value;
+    temp_bit_value=sData[threadIdx.x]&bit_mask_3;
+    if((temp_bit_value)==bit_mask_0){
+        bit_value=0;
+    }else if((temp_bit_value)==bit_mask_1){
+        bit_value=1;
+    }else if((temp_bit_value)==bit_mask_2){
+        bit_value=2;
+    }else if((temp_bit_value)==bit_mask_3){
+        bit_value=3;
+    }
+    // compute False potision
+    FalseBuffer_0[threadIdx.x]=(bit_value == 0)?1:0;
+    FalseBuffer_1[threadIdx.x]=(bit_value == 1)?1:0;
+    FalseBuffer_2[threadIdx.x]=(bit_value == 2)?1:0;
+    FalseBuffer_3[threadIdx.x]=(bit_value == 3)?1:0;
+    __syncthreads();
+    
+    PrefixFalseBuffer_0[threadIdx.x+1]=FalseBuffer_0[threadIdx.x];
+    PrefixFalseBuffer_1[threadIdx.x+1]=FalseBuffer_1[threadIdx.x];
+    PrefixFalseBuffer_2[threadIdx.x+1]=FalseBuffer_2[threadIdx.x];
+    PrefixFalseBuffer_3[threadIdx.x+1]=FalseBuffer_3[threadIdx.x];
+    __syncthreads();
+    ScanBlock(PrefixFalseBuffer_0+1);// The last one is total false
+    ScanBlock(PrefixFalseBuffer_1+1);// The last one is total false
+    ScanBlock(PrefixFalseBuffer_2+1);// The last one is total false
+    ScanBlock(PrefixFalseBuffer_3+1);// The last one is total false
+    __syncthreads();
+    // save to global prefixFalseBuffer
+    local_prefix0[tid]=PrefixFalseBuffer_0[threadIdx.x];
+    local_prefix1[tid]=PrefixFalseBuffer_1[threadIdx.x];
+    local_prefix2[tid]=PrefixFalseBuffer_2[threadIdx.x];
+    local_prefix3[tid]=PrefixFalseBuffer_3[threadIdx.x];
+
+    if(threadIdx.x==0){
+        dev_BlockSum[blockIdx.x+0*BlockNum]=PrefixFalseBuffer_0[block_element_num];
+        dev_BlockSum[blockIdx.x+1*BlockNum]=PrefixFalseBuffer_1[block_element_num];
+        dev_BlockSum[blockIdx.x+2*BlockNum]=PrefixFalseBuffer_2[block_element_num];
+        dev_BlockSum[blockIdx.x+3*BlockNum]=PrefixFalseBuffer_3[block_element_num];
+    }
+    __threadfence();
+    __syncthreads();
+}
+
+__global__ void BLOCK_PREFIX(unsigned int* dev_BlockSum,unsigned int* dev_BlockSum_Prefix , int num_data){
+    int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    if(tid>= num_data) return ;
+    for(int i=1;i<num_data;i++){
+        dev_BlockSum_Prefix[i]=dev_BlockSum_Prefix[i-1]+dev_BlockSum[i-1];
+        __threadfence();
+    }
+}
+
+__global__ void Reorder(unsigned int* src_data,unsigned int* BlockSum_Prefix,unsigned int* local_prefix0,unsigned int* local_prefix1,unsigned int* local_prefix2,unsigned int* local_prefix3,unsigned int* dev_BlockSum,int num_data,int PASS){
+    int tid=blockDim.x*blockIdx.x+threadIdx.x;
+    if(tid>= num_data) return ;
+    
+    unsigned int bit_mask_0=(0 << (PASS*2));
+    unsigned int bit_mask_1=(1 << (PASS*2));
+    unsigned int bit_mask_2=(2 << (PASS*2));    
+    unsigned int bit_mask_3=(3 << (PASS*2));
+    unsigned int bit_value;
+    int BlockNum=(num_data+BlockSize-1)/BlockSize;
+    unsigned int block_element_num=(blockIdx.x+1)*BlockSize<=num_data?BlockSize:num_data%BlockSize;
+    
+    __shared__ unsigned int sData[BlockSize];
+    __shared__ unsigned int GlobalPosition[BlockSize];
+    sData[threadIdx.x]=((unsigned int*)src_data)[tid]; 
+    unsigned int temp_bit_value;
+    temp_bit_value=sData[threadIdx.x]&bit_mask_3;
+    // // compute the global position
+    if(temp_bit_value==bit_mask_0){
+        GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+0*BlockNum]+local_prefix0[(blockIdx.x*BlockSize)+threadIdx.x];
+    }else if(temp_bit_value==bit_mask_1){
+        GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+1*BlockNum]+local_prefix1[(blockIdx.x*BlockSize)+threadIdx.x];
+    }else if(temp_bit_value==bit_mask_2){
+        GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+2*BlockNum]+local_prefix2[(blockIdx.x*BlockSize)+threadIdx.x];
+    }else if(temp_bit_value==bit_mask_3){
+        GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+3*BlockNum]+local_prefix3[(blockIdx.x*BlockSize)+threadIdx.x];
+    }
+    __threadfence();
+    __syncthreads();
+    // //re order the element 
+    src_data[GlobalPosition[threadIdx.x]]=(sData)[threadIdx.x];
+}
 
 // Auxiliariy function
 void INPUT(char* FIN,int N);
@@ -33,6 +185,32 @@ void OUTPUT(char* FOUT,int N);
 void SHOW(int N);
 void SHOW_BIN(int N);
 bool EVALUATE(int N);
+void SHOW_DEV_BUFFER(void* A,int N){
+    int* BUF=new int[N];
+    cudaMemcpy(BUF, A, sizeof(float)*N, cudaMemcpyDeviceToHost);
+    for(int i=0;i<N;i++){
+        cout << BUF[i]<<" ";
+    }
+    cout <<endl;
+    delete BUF;
+};
+void SHOW_DEV_BUFFER_BIN(void* A,int N){
+    cout << "======== Current Data BINARY =======\n";
+    int* BUF=new int[N];
+    cudaMemcpy(BUF, A, sizeof(float)*N, cudaMemcpyDeviceToHost);
+    for(int i=0;i<N;i++){
+        for(int k=0;k<32;k++){
+            cout << ((((unsigned int *)BUF)[i]&(0x80000000>>k))?"1":"0");
+        }
+        cout << endl;
+    }
+    cout <<endl;
+    delete BUF;
+    cout << "\n==================================\n";
+};
+
+
+
 int main(int argc, char **argv){
     if(argc!=4){
         cout << "The input format must be ./program N input_data output_path" <<endl;
@@ -49,27 +227,78 @@ int main(int argc, char **argv){
     Data=new float[N];
     INPUT(FIN,N);
     SHOW(N);
-    SHOW_BIN(N);
     // cuda preprocess
+    int BlockNum=(N+BlockSize-1)/BlockSize;
     cudaMalloc((void**)&dev_srcData,sizeof(float)*N);
     cudaMalloc((void**)&dev_dstData,sizeof(float)*N);
-    cudaMemcpy(dev_srcData, Data, sizeof(float)*N, cudaMemcpyHostToDevice);
+    cudaMalloc((void**)&dev_BlockSum,sizeof(unsigned int)*Way_N*BlockNum);
+    cudaMalloc((void**)&dev_BlockSum_Status,sizeof(unsigned int)*(Way_N*BlockNum+1));
+    cudaMalloc((void**)&dev_BlockSum_Prefix,sizeof(unsigned int)*(Way_N*BlockNum+1));
 
-    int num_lists = 128; // the number of parallel threads
+    
+    cudaMalloc((void**)&local_prefix0,sizeof(unsigned int)*(N+1));
+    cudaMalloc((void**)&local_prefix1,sizeof(unsigned int)*(N+1));
+    cudaMalloc((void**)&local_prefix2,sizeof(unsigned int)*(N+1));
+    cudaMalloc((void**)&local_prefix3,sizeof(unsigned int)*(N+1));
+    cudaMemcpy(dev_srcData, Data, sizeof(float)*N, cudaMemcpyHostToDevice);
+    
+    
     // radix sort
-    cudaEventRecord( start, 0 ) ;
+    cudaEventRecord( start, 0 );
+    Data_Preprocess<<< BlockNum,BlockSize>>>(dev_srcData,N);
     // GPU_radix_sort<<<1,num_lists>>>(dev_srcData, dev_dstData, num_lists, N);
-    Data_Preprocess<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_srcData,N);
-    Intra_Block_radix_sort<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_srcData,dev_dstData,N);
-    Data_Postprocess<<< (N+BlockSize-1)/BlockSize,BlockSize>>>(dev_dstData,N);
+    // show the init data
+    
+    cudaMemcpy(Data, dev_srcData, sizeof(float)*N, cudaMemcpyDeviceToHost);
+    printf("The INITIAL DATA\n");
+    SHOW_BIN(N);
+    for(int i=0;i<16;i++){
+        // Init_Flag<<<1,32>>>();
+        // Intra_Block_radix_sort<<< BlockNum,BlockSize>>>(dev_srcData,N,dev_BlockSum,dev_BlockSum_Prefix,i,&BLOCK_PREFIX_COMPLETE);
+        // cudaMemcpy(Data, dev_srcData, sizeof(float)*N, cudaMemcpyDeviceToHost);
+
+        // compute global sum and the local_prefix
+        Radix_GSum_LPrefix<<<BlockNum,BlockSize>>>((unsigned int*)dev_srcData,local_prefix0,local_prefix1,local_prefix2,local_prefix3,dev_BlockSum,N,i);
+        cout << "local_prefix0\n";
+        SHOW_DEV_BUFFER(local_prefix0,N);
+        cout << "local_prefix1\n";
+        SHOW_DEV_BUFFER(local_prefix1,N);
+        cout << "local_prefix2\n";
+        SHOW_DEV_BUFFER(local_prefix2,N);
+        cout << "local_prefix3\n";
+        SHOW_DEV_BUFFER(local_prefix3,N);
+        cout << "BLOCK SUM\n";
+        SHOW_DEV_BUFFER(dev_BlockSum,Way_N*BlockNum);
+        // compute global prefix sum
+        BLOCK_PREFIX<<<1,1>>>(dev_BlockSum,dev_BlockSum_Prefix ,Way_N*BlockNum);
+        cout << "BLOCK PREFIX SUM\n";
+        SHOW_DEV_BUFFER(dev_BlockSum_Prefix,Way_N*BlockNum);
+        // reorder
+        Reorder<<<BlockNum,BlockSize>>>((unsigned int*)dev_srcData, dev_BlockSum_Prefix, local_prefix0,local_prefix1,local_prefix2,local_prefix3,dev_BlockSum,N,i);
+        
+        cout << "ReOrder Data\n";
+        SHOW_DEV_BUFFER_BIN(dev_srcData,N);
+
+        printf("The PASS %d RESULT\n",i);
+        // SHOW_BIN(N);
+        cudaThreadSynchronize();
+    }
+    Data_Postprocess<<< BlockNum,BlockSize>>>(dev_srcData,N);
     cudaEventRecord( stop, 0 ) ;
     cudaEventSynchronize( stop );
 
     // cuda postprocess
-    cudaMemcpy(Data, dev_dstData, sizeof(float)*N, cudaMemcpyDeviceToHost);
+    cudaMemcpy(Data, dev_srcData, sizeof(float)*N, cudaMemcpyDeviceToHost);
     // output
     cudaFree(dev_srcData);
     cudaFree(dev_dstData);
+    cudaFree(dev_BlockSum);
+    cudaFree(dev_BlockSum_Status);
+    cudaFree(dev_BlockSum_Prefix);
+    cudaFree(local_prefix0);
+    cudaFree(local_prefix1);
+    cudaFree(local_prefix2);
+    cudaFree(local_prefix3);
     SHOW(N);
     OUTPUT(FOUT,N);
 
@@ -125,121 +354,6 @@ bool EVALUATE(int N){
     return PASS;
 }
 
-__global__ void GPU_radix_sort(float*  src_data, float*  dest_data, \
-    int num_lists, int num_data) {
-    // temp_data:temporarily store the data
-    int tid = blockIdx.x*blockDim.x + threadIdx.x;
-    // special preprocessing of IEEE floating-point numbers before applying radix sort
-    preprocess_float(src_data, num_lists, num_data, tid); 
-    __syncthreads();
-   // no shared memory
-    radix_sort(src_data, dest_data, num_lists, num_data, tid);
-    __syncthreads();
-    merge_list(src_data, dest_data, num_lists, num_data, tid);    
-    __syncthreads();
-    Aeprocess_float(dest_data, num_lists, num_data, tid);
-    __syncthreads();
-}
-
-__device__ void preprocess_float(float*  src_data, int num_lists, int num_data, int tid){
-    for(int i = tid;i<num_data;i+=num_lists)
-    {
-        unsigned int *data_temp = (unsigned int *)(&src_data[i]);    
-        *data_temp = (*data_temp >> 31 & 0x1)? ~(*data_temp): ((*data_temp) | 0x80000000); 
-    }
-}
-
-__device__ void Aeprocess_float(float*  data, int num_lists, int num_data, int tid){
-    for(int i = tid;i<num_data;i+=num_lists)
-    {
-        unsigned int* data_temp = (unsigned int *)(&data[i]);
-        *data_temp = (*data_temp >> 31 & 0x1)? (*data_temp) & 0x7fffffff: ~(*data_temp);
-    }
-}
-
-
-__device__ void radix_sort(float*  data_0, float*  data_1, \
-    int num_lists, int num_data, int tid) {
-    for(int bit=0;bit<32;bit++)
-    {
-        int bit_mask = (1 << bit);
-        int count_0 = 0;
-        int count_1 = 0;
-        for(int i=tid; i<num_data;i+=num_lists)
-        {
-            unsigned int *temp =(unsigned int *) &data_0[i];
-            if(*temp & bit_mask)
-            {
-                data_1[tid+count_1*num_lists] = data_0[i]; //bug 在这里 等于时会做强制类型转化
-                count_1 += 1;
-            }
-            else{
-                data_0[tid+count_0*num_lists] = data_0[i];
-                count_0 += 1;
-            }
-        }
-        for(int j=0;j<count_1;j++)
-        {
-            data_0[tid + count_0*num_lists + j*num_lists] = data_1[tid + j*num_lists]; 
-        }
-    }
-}
-
-__device__ void merge_list( float* src_data, float*  dest_list, \
-    int num_lists, int num_data, int tid) {
-    int num_per_list = ceil((float)num_data/num_lists);
-    __shared__ int list_index[MAX_NUM_LISTS];
-    __shared__ float record_val[MAX_NUM_LISTS];
-    __shared__ int record_tid[MAX_NUM_LISTS];
-    list_index[tid] = 0;
-    record_val[tid] = 0;
-    record_tid[tid] = tid;
-    __syncthreads();
-    for(int i=0;i<num_data;i++)
-    {
-        record_val[tid] = 0;
-        record_tid[tid] = tid; // bug2 每次都要进行初始化
-        if(list_index[tid] < num_per_list)
-        {
-            int src_index = tid + list_index[tid]*num_lists;
-            if(src_index < num_data)
-            {
-                record_val[tid] = src_data[src_index];
-            }else{
-                unsigned int *temp = (unsigned int *)&record_val[tid];
-                *temp = 0xffffffff;
-            }
-        }else{
-                unsigned int *temp = (unsigned int *)&record_val[tid];
-                *temp = 0xffffffff;
-        }
-        __syncthreads();
-        int tid_max = num_lists >> 1;
-        while(tid_max != 0 )
-        {
-            if(tid < tid_max)
-            {
-                unsigned int* temp1 = (unsigned int*)&record_val[tid];
-                unsigned int *temp2 = (unsigned int*)&record_val[tid + tid_max];
-                if(*temp2 < *temp1)
-                {
-                    record_val[tid] = record_val[tid + tid_max];
-                    record_tid[tid] = record_tid[tid + tid_max];
-                }
-            }
-            tid_max = tid_max >> 1;
-            __syncthreads();
-        }
-        if(tid == 0)
-        {
-            list_index[record_tid[0]]++;
-            dest_list[i] = record_val[0];
-        }
-        __syncthreads();
-    }
-}
-
-
 
 __global__ void Data_Preprocess(float* src_data,int num_data){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
@@ -263,108 +377,156 @@ __device__ void SHOW_BUFFER(unsigned int* sData , int num_data){
 }
 
 
-__device__ void ScanWarp(unsigned int* sData,unsigned int lane){
-    // if(lane==0){
-    //     for(int i=1;i<32;i++){
-    //         sData[i]+=sData[i-1];
-    //     }
-    // }
-    // Kogge-Stone
-    if(lane>=1)
-        sData[lane]+=sData[lane-1];
-    __syncwarp();
-    if(lane>=2)
-        sData[lane]+=sData[lane-2];
-     __syncwarp();
-    if(lane>=4)
-        sData[lane]+=sData[lane-4];
-    __syncwarp();
-    if(lane>=8)
-        sData[lane]+=sData[lane-8];
-    __syncwarp();
-    if(lane>=16)
-        sData[lane]+=sData[lane-16];
-    __syncwarp();
-    // // Reduce-then-scan
-    // if(lane&0x00000001)
-    //     sData[lane]+=sData[lane-1];
-    // __syncwarp();
-    // if(lane&0x00000011)
-    //     sData[lane]+=sData[lane-2];
-    // __syncwarp();
-    // if(lane&0x00000111)
-    //     sData[lane]+=sData[lane-1];
-    // __syncwarp();
-    
+
+__device__ void SHOW_BUFFER(void* Buffer,int size){
+    if(threadIdx.x==0){
+        for(int i=0;i<size;i++){
+            printf("%d ",((unsigned int*)Buffer)[i]);
+        }
+        printf("\n");
+    }
 }
-__device__ void ScanBlock(unsigned int* sData){
-    unsigned int warp_id=threadIdx.x>>5; // each warp has 32 thread
-    unsigned int lane = threadIdx.x & 31;  // 31 = 00011111 (i.e. mod 31)
-    __shared__  unsigned int warp_sum[32];  // block size 1024 / warp size 32 = 32 
-    ScanWarp(sData+(warp_id<<5),lane);
-    __syncthreads();
-    if(lane==31){
-        warp_sum[warp_id]=sData[threadIdx.x];
+__device__ void SHOW_BUFFER_BIN(void* Buffer,int size){
+    printf("======== Current Data BINARY =======\n");
+    for(int i=0;i<size;i++){
+        for(int k=0;k<32;k++){
+            printf("%c", ((((unsigned int *)Buffer)[i]&(0x80000000>>k))?'1':'0'));
+        }
+        printf("\n");
     }
-    __syncthreads();
-    if(warp_id==0){
-        ScanWarp(warp_sum,lane);
-    }
-    __syncthreads();
-    if(warp_id>0){
-        *(sData+threadIdx.x)+=warp_sum[warp_id-1];
-    }
-    __syncthreads();
+    printf("\n==================================\n");
 }
 
-__global__ void Intra_Block_radix_sort(float* src_data,float* dest_data,int num_data){
+__global__ void Intra_Block_radix_sort(float* src_data,int num_data,unsigned int *BlockSum,unsigned int *BlockSum_Prefix,int PASS,unsigned int* BLOCK_PREFIX_COMPLETE){
     int tid=blockDim.x*blockIdx.x+threadIdx.x;
     if(tid>= num_data) return ;
-    // // load block data to share memory
+    // // // load block data to share memory
     __shared__ unsigned int sData[BlockSize];
-    __shared__ unsigned int tempData[BlockSize];
-    __shared__ unsigned int FalseBuffer[BlockSize+1]; // e buffer
-    __shared__ unsigned int PrefixFalseBuffer[BlockSize+1]; // f buffer
-    __shared__ unsigned int Position[BlockSize];
-    unsigned int bit_mask=1;
+
+    __shared__ unsigned int FalseBuffer_0[BlockSize+1]; // e0 buffer
+    __shared__ unsigned int FalseBuffer_1[BlockSize+1]; // e1 buffer
+    __shared__ unsigned int FalseBuffer_2[BlockSize+1]; // e2 buffer
+    __shared__ unsigned int FalseBuffer_3[BlockSize+1]; // e3 buffer
+
+
+    __shared__ unsigned int PrefixFalseBuffer_0[BlockSize+1]; // f0 buffer
+    __shared__ unsigned int PrefixFalseBuffer_1[BlockSize+1]; // f1 buffer
+    __shared__ unsigned int PrefixFalseBuffer_2[BlockSize+1]; // f2 buffer
+    __shared__ unsigned int PrefixFalseBuffer_3[BlockSize+1]; // f3 buffer
+
+    __shared__ unsigned int GlobalPosition[BlockSize];
+    unsigned int bit_mask_0=0 << (PASS*2);
+    unsigned int bit_mask_1=1 << (PASS*2);
+    unsigned int bit_mask_2=2 << (PASS*2);    
+    unsigned int bit_mask_3=3 << (PASS*2);
+    unsigned int bit_value;
+    int BlockNum=(num_data+BlockSize-1)/BlockSize;
+
+    unsigned int block_element_num=(blockIdx.x+1)*BlockSize<=num_data?BlockSize:num_data%BlockSize;
+
+  
     sData[threadIdx.x]=((unsigned int*)src_data)[tid]; 
-
     __syncthreads();
-    // 32 pass radix sort
-    for(int i=0;i<32;i++){
-        // compte False potision
-        FalseBuffer[threadIdx.x]=(sData[threadIdx.x]&bit_mask)?0:1;
-
-        
-        
-        __syncthreads();
-        //prefix sum
-        // if(tid==0){
-        //     PrefixFalseBuffer[0]=0;
-        //     for(int k=1;k<num_data;k++){
-        //         PrefixFalseBuffer[k]=PrefixFalseBuffer[k-1]+FalseBuffer[k-1];
-        //     }
-        //     total_False=PrefixFalseBuffer[num_data-1]+FalseBuffer[num_data-1];
-        // }
-        // __syncthreads();
-        PrefixFalseBuffer[tid+1]=FalseBuffer[tid];
-        __syncthreads();
-        ScanBlock(PrefixFalseBuffer+1);// The last one is total false
-        __syncthreads();
-        // // compute position
-        Position[tid]=FalseBuffer[tid]?PrefixFalseBuffer[tid]:tid-PrefixFalseBuffer[tid]+PrefixFalseBuffer[num_data];
-
-        
-        __syncthreads();
-        // scatter
-        tempData[Position[tid]]=sData[tid];
-        bit_mask<<=1;
-        __syncthreads();
-        // // save data
-        sData[threadIdx.x]=tempData[tid];
-        __syncthreads();
+    // // // check the bit_value , using the largest bit mask to mask the other bit
+    unsigned int temp_bit_value;
+    temp_bit_value=sData[threadIdx.x]&bit_mask_3;
+    if((temp_bit_value)==bit_mask_0){
+        bit_value=0;
+    }else if((temp_bit_value)==bit_mask_1){
+        bit_value=1;
+    }else if((temp_bit_value)==bit_mask_2){
+        bit_value=2;
+    }else if((temp_bit_value)==bit_mask_3){
+        bit_value=3;
     }
-    
-    dest_data[tid]=((float*)sData)[threadIdx.x];
+
+        
+    // compute False potision
+    FalseBuffer_0[threadIdx.x]=(bit_value == 0)?1:0;
+    FalseBuffer_1[threadIdx.x]=(bit_value == 1)?1:0;
+    FalseBuffer_2[threadIdx.x]=(bit_value == 2)?1:0;
+    FalseBuffer_3[threadIdx.x]=(bit_value == 3)?1:0;
     __syncthreads();
+    
+    PrefixFalseBuffer_0[threadIdx.x+1]=FalseBuffer_0[threadIdx.x];
+    PrefixFalseBuffer_1[threadIdx.x+1]=FalseBuffer_1[threadIdx.x];
+    PrefixFalseBuffer_2[threadIdx.x+1]=FalseBuffer_2[threadIdx.x];
+    PrefixFalseBuffer_3[threadIdx.x+1]=FalseBuffer_3[threadIdx.x];
+    __syncthreads();
+    ScanBlock(PrefixFalseBuffer_0+1);// The last one is total false
+    ScanBlock(PrefixFalseBuffer_1+1);// The last one is total false
+    ScanBlock(PrefixFalseBuffer_2+1);// The last one is total false
+    ScanBlock(PrefixFalseBuffer_3+1);// The last one is total false
+    __syncthreads();
+
+    // // block sum and block status
+    if(threadIdx.x==0){
+        // printf("Hi here is block %d The Prefix 0 is %d \n",blockIdx.x,PrefixFalseBuffer_0[last]);
+        BlockSum[blockIdx.x+0*BlockNum]=PrefixFalseBuffer_0[block_element_num];
+        // BlockSum_Status[blockIdx.x+0*BlockNum+1]=PARTIAL;
+        // printf("Hi here is block %d The Prefix 1 is %d \n",blockIdx.x,PrefixFalseBuffer_1[last]);
+        BlockSum[blockIdx.x+1*BlockNum]=PrefixFalseBuffer_1[block_element_num];
+        // BlockSum_Status[blockIdx.x+1*BlockNum+1]=PARTIAL;
+        // printf("Hi here is block %d The Prefix 2 is %d \n",blockIdx.x,PrefixFalseBuffer_2[last]);
+        BlockSum[blockIdx.x+2*BlockNum]=PrefixFalseBuffer_2[block_element_num];
+        // BlockSum_Status[blockIdx.x+2*BlockNum+1]=PARTIAL;
+        // printf("Hi here is block %d The Prefix 3 is %d \n",blockIdx.x,PrefixFalseBuffer_3[last]);
+        BlockSum[blockIdx.x+3*BlockNum]=PrefixFalseBuffer_3[block_element_num];
+        // BlockSum_Status[blockIdx.x+3*BlockNum+1]=PARTIAL;
+        // init the first block
+        if(blockIdx.x==0){
+            // BlockSum_Status[blockIdx.x+0*BlockNum]=PREFIX;
+            BlockSum_Prefix[0]=0;
+        }
+        __threadfence(); // 可以保證 前面對global memory 的 IO都做完了 才increase
+        __syncthreads();
+        unsigned int value = atomicInc(&BLOCK_PREFIX_COUNTER,1);
+        printf("block %d my value is %d \n",blockIdx.x,value);
+        if(value==BlockNum-1){
+            for(int j=1;j<Way_N*BlockNum+1;j++){
+                BlockSum_Prefix[j]=BlockSum_Prefix[j-1]+BlockSum[j-1];
+                __threadfence(); // 也需要保證 前面的 PREFIX 確定寫入 才可以 執行下一次 prefix
+            }
+            atomicInc((unsigned int *)BLOCK_PREFIX_COMPLETE,1);
+            __threadfence();
+            // printf("complete\n");
+        }
+        // SHOW_BUFFER(BlockSum_Prefix,Way_N*BlockNum+1);
+        // SHOW_BUFFER(sData,num_data);
+        // __syncthreads();
+       
+        
+        // printf("block %d status %d\n",blockIdx.x,BLOCK_PREFIX_COMPLETE);
+        } 
+        // while((*BLOCK_PREFIX_COMPLETE)!=1){
+        //     // continue;
+        //     // printf("block %d status %d\n",blockIdx.x,BLOCK_PREFIX_COMPLETE);
+        // }; //wait the prefix complete
+        
+        
+    //     // compute global data
+        temp_bit_value=sData[threadIdx.x]&bit_mask_3;
+        if(temp_bit_value==bit_mask_0){
+            // printf("(0)Here is PASS : %d , BLOCK %d ,thread %d , BLOCKSUM PRE : %d , FALSE BUFFER PRE : %d\n",i,blockIdx.x,threadIdx.x,BlockSum_Prefix[blockIdx.x+0*BlockNum],PrefixFalseBuffer_0[threadIdx.x]);
+            GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+0*BlockNum]+PrefixFalseBuffer_0[threadIdx.x];
+        }else if(temp_bit_value==bit_mask_1){
+            // printf("(1)Here is PASS : %d , BLOCK %d ,thread %d , BLOCKSUM PRE : %d , FALSE BUFFER PRE : %d\n",i,blockIdx.x,threadIdx.x,BlockSum_Prefix[blockIdx.x+1*BlockNum],PrefixFalseBuffer_1[threadIdx.x]);
+            GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+1*BlockNum]+PrefixFalseBuffer_1[threadIdx.x];
+        }else if(temp_bit_value==bit_mask_2){
+            // printf("(2)Here is PASS : %d , BLOCK %d ,thread %d , BLOCKSUM PRE : %d , FALSE BUFFER PRE : %d\n",i,blockIdx.x,threadIdx.x,BlockSum_Prefix[blockIdx.x+2*BlockNum],PrefixFalseBuffer_2[threadIdx.x]);
+            GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+2*BlockNum]+PrefixFalseBuffer_2[threadIdx.x];
+        }else if(temp_bit_value==bit_mask_3){
+            // printf("(3)Here is PASS : %d , BLOCK %d ,thread %d , BLOCKSUM PRE : %d , FALSE BUFFER PRE : %d\n",i,blockIdx.x,threadIdx.x,BlockSum_Prefix[blockIdx.x+3*BlockNum],PrefixFalseBuffer_3[threadIdx.x]);
+            GlobalPosition[threadIdx.x]=BlockSum_Prefix[blockIdx.x+3*BlockNum]+PrefixFalseBuffer_3[threadIdx.x];
+        }
+        __syncthreads();
+        src_data[GlobalPosition[threadIdx.x]]=((float*)sData)[threadIdx.x];
+
+    //     __syncthreads();
+    //     if(threadIdx.x==0 && blockIdx.x==0){
+    //         printf("(%d)Global position %d PASS  \n",blockIdx.x,block_element_num);
+    //         SHOW_BUFFER((void*) GlobalPosition,block_element_num);
+    //     }
+        // src_data[GlobalPosition[threadIdx.x]]=((float*)sData)[threadIdx.x];
+
 }
